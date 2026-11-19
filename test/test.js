@@ -49,6 +49,26 @@ function trianglePerimeter(triangles, vertices, dim = 2) {
     return perimeter;
 }
 
+function triangleQualityStats(triangles, vertices, dim = 2) {
+    let slivers = 0, sumQ = 0;
+    const count = triangles.length / 3;
+
+    for (let i = 0; i < triangles.length; i += 3) {
+        const ax = vertices[triangles[i] * dim], ay = vertices[triangles[i] * dim + 1];
+        const bx = vertices[triangles[i + 1] * dim], by = vertices[triangles[i + 1] * dim + 1];
+        const cx = vertices[triangles[i + 2] * dim], cy = vertices[triangles[i + 2] * dim + 1];
+        const abx = ax - bx, aby = ay - by;
+        const bcx = bx - cx, bcy = by - cy;
+        const cax = cx - ax, cay = cy - ay;
+        const area2 = Math.abs((bx - ax) * (cy - ay) - (by - ay) * (cx - ax));
+        const sumSq = abx * abx + aby * aby + bcx * bcx + bcy * bcy + cax * cax + cay * cay;
+        const q = sumSq ? 2 * Math.sqrt(3) * area2 / sumSq : 0;
+        if (q < 0.1) slivers++;
+        sumQ += q;
+    }
+    return {count, slivers, meanQ: count ? sumQ / count : 0};
+}
+
 function countIllegalEdges(triangles, vertices, dim = 2) {
     const halfEdges = new Int32Array(triangles.length);
     halfEdges.fill(-1);
@@ -274,7 +294,7 @@ test('refine legalizes all convex interior edges in earcut fixture', () => {
     assert.equal(deviation(data.vertices, data.holes, data.dimensions, triangles), 0);
 });
 
-test('mvt fixture has zero deviation and refined quality', () => {
+test('mvt fixture has zero deviation and automatic quality', () => {
     const polys = readTilesFixture();
     let nonzero = 0;
     let firstIndex = -1;
@@ -291,12 +311,19 @@ test('mvt fixture has zero deviation and refined quality', () => {
     let lengthChanged = 0;
     let basePerimeter = 0;
     let refinedPerimeter = 0;
+    let baseSlivers = 0;
+    let baseQualitySum = 0;
+    let triangleCount = 0;
 
     for (let i = 0; i < polys.length; i++) {
         const data = polys[i];
         const triangles = earcut(data.vertices, data.holes, data.dimensions);
         const length = triangles.length;
         basePerimeter += trianglePerimeter(triangles, data.vertices, data.dimensions);
+        const quality = triangleQualityStats(triangles, data.vertices, data.dimensions);
+        baseSlivers += quality.slivers;
+        baseQualitySum += quality.meanQ * quality.count;
+        triangleCount += quality.count;
         const dev = deviation(data.vertices, data.holes, data.dimensions, triangles);
         if (dev !== 0) {
             if (firstIndex < 0) {
@@ -340,7 +367,58 @@ test('mvt fixture has zero deviation and refined quality', () => {
         `${refinedNonzero} refined polygons with nonzero deviation; first ${refinedFirstIndex}: ${refinedFirstDev}, ` +
         `worst ${refinedWorstIndex}: ${refinedWorstDev}, sum ${refinedSumDev}`);
 
-    assert.ok(refinedPerimeter < basePerimeter * 0.72, `refined perimeter ratio ${refinedPerimeter / basePerimeter} < 0.72`);
+    // Before automatic quality refinement, this fixture had 268,813 slivers (q < 0.1) and mean q 0.429.
+    assert.ok(baseSlivers / triangleCount < 0.05,
+        `sliver ratio ${baseSlivers / triangleCount} < 0.05 (was ${268813 / triangleCount})`);
+    assert.ok(baseQualitySum / triangleCount > 0.58,
+        `mean quality ${baseQualitySum / triangleCount} > 0.58 (was 0.429)`);
+    assert.ok(refinedPerimeter < basePerimeter * 1.001,
+        `second quality pass should be nearly idempotent, perimeter ratio ${refinedPerimeter / basePerimeter} < 1.001`);
+});
+
+test('automatic quality pass improves hole-heavy fixtures', () => {
+    // Recorded before automatic refinement: water 380 slivers / mean q 0.413,
+    // water-huge2 996 / 0.341, touching-holes6 859 / 0.328, hole-touching-outer 16 / 0.368.
+    const cases = [
+        {id: 'water', maxSlivers: 60, minMeanQ: 0.60},
+        {id: 'water-huge2', maxSlivers: 220, minMeanQ: 0.55},
+        {id: 'touching-holes6', maxSlivers: 220, minMeanQ: 0.52},
+        {id: 'hole-touching-outer', maxSlivers: 5, minMeanQ: 0.50}
+    ];
+
+    for (const {id, maxSlivers, minMeanQ} of cases) {
+        const coords = JSON.parse(fs.readFileSync(new URL(`fixtures/${id}.json`, import.meta.url)));
+        const data = flatten(coords);
+        const triangles = earcut(data.vertices, data.holes, data.dimensions);
+        const quality = triangleQualityStats(triangles, data.vertices, data.dimensions);
+
+        assert.ok(quality.slivers <= maxSlivers, `${id}: ${quality.slivers} slivers <= ${maxSlivers}`);
+        assert.ok(quality.meanQ >= minMeanQ, `${id}: mean quality ${quality.meanQ} >= ${minMeanQ}`);
+        assert.ok(deviation(data.vertices, data.holes, data.dimensions, triangles) < 0.01, `${id}: area preserved`);
+    }
+});
+
+test('self-intersecting bow tie is repaired without introducing degenerate triangles', () => {
+    const source = [[0, 0], [2, 2], [2, 0], [0, 2]];
+
+    for (const rotation of [0, 90, 180, 270]) {
+        const theta = rotation * Math.PI / 180;
+        const xx = Math.round(Math.cos(theta)), xy = Math.round(-Math.sin(theta));
+        const yx = Math.round(Math.sin(theta)), yy = Math.round(Math.cos(theta));
+        const vertices = source.flatMap(([x, y]) => [xx * x + xy * y, yx * x + yy * y]);
+        const triangles = earcut(vertices);
+
+        assert.equal(triangles.length / 3, 2);
+        let area = 0;
+        for (let i = 0; i < triangles.length; i += 3) {
+            const a = triangles[i] * 2, b = triangles[i + 1] * 2, c = triangles[i + 2] * 2;
+            const twiceArea = orient(vertices[a], vertices[a + 1], vertices[b], vertices[b + 1],
+                vertices[c], vertices[c + 1]);
+            assert.ok(twiceArea > 0, `rotation ${rotation}: triangle winding/area ${twiceArea}`);
+            area += twiceArea / 2;
+        }
+        assert.ok(Math.abs(area - 4) < 1e-12, `rotation ${rotation}: repaired area ${area}`);
+    }
 });
 
 // Regression for the hole-bridge block index (issue #183): a collinear-rich outer ring

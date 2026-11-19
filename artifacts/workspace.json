@@ -1,0 +1,17 @@
+{
+  "root": "/home/dev/feedback/uid26323",
+  "B": "/home/dev/feedback/uid26323",
+  "sha": "6f467ca642c8d318a94af35a70f8e7aae03f6db2",
+  "wslDistro": "Ubuntu-26.04",
+  "source": {
+    "owner": "mapbox",
+    "repo": "earcut",
+    "sha": "6f467ca642c8d318a94af35a70f8e7aae03f6db2"
+  },
+  "fork": {
+    "owner": "Rrr119",
+    "repo": "earcut",
+    "cloneUrl": "https://github.com/Rrr119/earcut.git"
+  },
+  "at": "2026-11-18T23:40:45.867Z"
+}

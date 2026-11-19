@@ -7,9 +7,11 @@ The fastest and smallest JavaScript **polygon triangulation** library. 4KB gzipp
 ![Earcut triangulation example](earcut.png)
 
 Earcut is designed to be fast enough for real-time [triangulation](https://en.wikipedia.org/wiki/Polygon_triangulation) in the browser,
-favoring raw speed and simplicity over triangulation quality,
-while being robust enough to handle most practical datasets without crashing or producing garbage,
-with an option to refine the result to [Delaunay](https://en.wikipedia.org/wiki/Delaunay_triangulation) quality at a small cost.
+while being robust enough to handle most practical datasets without crashing or producing garbage.
+When sliver ears are detected, earcut automatically performs a constrained
+[Delaunay](https://en.wikipedia.org/wiki/Delaunay_triangulation) edge-legalization pass to improve
+triangle uniformity without changing the triangle count; `refine()` remains available for a further
+explicit quality pass.
 Originally built for [Mapbox GL JS](https://www.mapbox.com/mapbox-gljs) (WebGL-based interactive maps),
 it's now also used by [Three.js](https://threejs.org/) and many other projects.
 
@@ -26,9 +28,12 @@ const triangles = earcut([10,0, 0,50, 60,60, 70,10]); // returns [1,0,3, 1,3,2]
 
 The library implements a modified ear slicing algorithm,
 optimized by [z-order curve](https://en.wikipedia.org/wiki/Z-order_curve) and spatial hashing
-and extended to handle holes, twisted polygons, degeneracies and self-intersections
-in a way that doesn't _guarantee_ correctness of triangulation,
-but attempts to always produce acceptable results for practical data.
+and extended to handle holes, twisted polygons, degeneracies and self-intersections.
+Hole bridges are validated against the merged ring and fall back to a shorter visible chord when the
+ray result is ambiguous. Rings that stall on a crossing are retried with a 2-opt untangling pass.
+Low-quality slivers are removed with constrained Delaunay flips. As before, this doesn't
+_guarantee_ correctness on arbitrary input, but attempts to always produce acceptable results for
+practical data.
 
 It's based on ideas from
 [FIST: Fast Industrial-Strength Triangulation of Polygons](https://www.cosy.sbg.ac.at/~held/projects/triang/triang.html) by Martin Held
@@ -39,18 +44,20 @@ and [Triangulation by Ear Clipping](https://www.geometrictools.com/Documentation
 Earcut is heavily optimized for its primary workload — triangulating polygons from
 [Mapbox Vector Tiles](https://github.com/mapbox/vector-tile-spec). On a representative
 benchmark of **119,680 real-world polygons** (1.9M vertices) drawn from a window of map tiles
-through zooms 4–16, it triangulates the whole set in **~445 ms** on a MacBook Pro M1 Pro (2021),
-with optional Delaunay refinement taking additional **~168 ms**.
+through zooms 4–16, it triangulates the whole set in roughly **0.5 seconds** in the bundled
+benchmark environment, including the automatic quality pass on polygons that contain slivers.
+An additional explicit `refine()` pass takes about **85 ms** and can improve the mean quality a
+little further.
 You can run the benchmark yourself with `npm run bench`.
 
 ## Robustness
 
-Earcut does **not** guarantee a correct triangulation on arbitrary input — it trades quality
-for speed, aiming to always produce an acceptable result on practical data without crashing or
-emitting garbage. The input is assumed to be a valid polygon: rings that don't self-cross or
-overlap, holes that stay inside the outer ring, and no duplicate or zero-length edges. On input
-that breaks these assumptions, the result can be noticeably wrong — overlapping triangles, gaps,
-or triangles outside the polygon. If correctness matters, clean your input first; for a
+Earcut does **not** guarantee a correct triangulation on arbitrary input — it aims to always
+produce an acceptable result on practical data without crashing or emitting garbage. Small
+self-intersections are healed locally, and a stalled outer ring is retried with a 2-opt untangling
+pass, but overlapping holes, holes outside the outer ring, and duplicate or zero-length edges can
+still produce noticeably wrong output — overlapping triangles, gaps, or triangles outside the
+polygon. If correctness matters, clean your input first; for a
 guaranteed-correct triangulation even on bad data, see
 [libtess.js](https://github.com/brendankenny/libtess.js) (slower and larger).
 
@@ -91,6 +98,10 @@ Alternatively, there's a UMD browser bundle with an `earcut` global variable (ex
 
 Each group of three vertex indices in the resulting array forms a triangle.
 
+If any generated triangle is below a normalized quality threshold (`q < 0.1`), `earcut` runs the
+same constrained Delaunay flip pass as `refine()` before returning. This preserves the triangle
+count, winding, polygon boundary, and holes, while removing most long, thin sliver triangles.
+
 ```js
 // triangulating a polygon with a hole
 earcut([0,0, 100,0, 100,100, 0,100,  20,20, 80,20, 80,80, 20,80], [4]);
@@ -107,7 +118,8 @@ Output triangles always have a consistent **winding order** regardless of the in
 
 ### `refine(triangles, vertices[, dimensions = 2])`
 
-If triangle quality matters, you can run an optional refinement pass after triangulation:
+Earcut already runs this pass automatically when normal ear clipping produces a sliver. You can run
+an additional explicit refinement pass when you want to keep legalizing already acceptable edges:
 
 ```js
 const triangles = earcut(vertices, holes, dimensions);
@@ -118,8 +130,7 @@ This mutates `triangles` in place, legalizing interior edges with Delaunay flips
 the polygon boundary and holes. It keeps the same number of triangles and the same index format,
 but usually removes many skinny triangles and reduces total triangle edge length.
 
-Refinement is a post-process, so it doesn't affect the speed of normal `earcut` calls unless you
-explicitly call it. It assumes a valid manifold triangulation, such as the output of `earcut`, and
+This post-process assumes a valid manifold triangulation, such as the output of `earcut`, and
 doesn't repair invalid polygon input or make the mesh conforming.
 
 ### `flatten(data)`

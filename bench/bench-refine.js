@@ -1,6 +1,6 @@
-// Benchmark the optional Delaunay refinement post-pass (refine() in src/earcut.js)
-// over the same realistic MVT fixture as bench-tiles.js. Measures the added cost of
-// refine() relative to earcut alone, and reports the resulting triangle quality.
+// Benchmark the explicit Delaunay refinement post-pass (refine() in src/earcut.js)
+// over the same realistic MVT fixture as bench-tiles.js. earcut already auto-refines
+// outputs that contain slivers, so this measures the additional pass's cost and quality.
 //
 // earcut is run ONCE per polygon at startup (untimed) and its index arrays are cached;
 // refine() mutates its input in place, so the timed pass resets a reusable copy from the

@@ -28,6 +28,16 @@ const splitStack = [];
 // handler to decide whether another clip pass is worth attempting before the costlier stages
 let filteredOut = false;
 
+// set when the slicer cannot split a ring that has no ears; triggers one retry with explicit
+// self-intersection repair instead of paying for a crossing scan on every ordinary polygon
+let repairNeeded = false;
+
+// normalized quality below which the output gets an automatic Delaunay edge-legalization pass.
+// This keeps ordinary polygons on the fast path while removing the long, thin ears that motivated
+// quality-aware clipping without changing the triangle count or the caller-visible API.
+const AUTO_REFINE_QUALITY = 0.1;
+let needsRefine = false;
+
 /**
  * Triangulate a polygon given as a flat array of vertex coordinates.
  *
@@ -38,12 +48,18 @@ let filteredOut = false;
  * @example earcut([10,0, 0,50, 60,60, 70,10]); // [1,0,3, 3,2,1]
  */
 export default function earcut(data, holeIndices, dim = 2) {
+    return runEarcut(data, holeIndices, dim, false);
+}
 
+/** @param {ArrayLike<number>} data @param {ArrayLike<number> | null | undefined} holeIndices @param {number} dim @param {boolean} repair */
+function runEarcut(data, holeIndices, dim, repair) {
     const hasHoles = holeIndices && holeIndices.length;
     const outerLen = hasHoles ? holeIndices[0] * dim : data.length;
     if (steiners.size) steiners.clear();
+    repairNeeded = false;
+    needsRefine = false;
 
-    let outerNode = linkedList(data, 0, outerLen, dim, true);
+    let outerNode = linkedList(data, 0, outerLen, dim, true, repair);
     /** @type {number[]} */
     const triangles = [];
 
@@ -77,16 +93,39 @@ export default function earcut(data, holeIndices, dim = 2) {
     earcutLinked(outerNode, triangles, minX, minY, invSize);
     while (splitStack.length) earcutLinked(/** @type {Node} */ (splitStack.pop()), triangles, minX, minY, invSize);
 
+    if (repairNeeded && !repair) {
+        triangles.length = 0;
+        splitStack.length = 0;
+        steiners.clear();
+        return runEarcut(data, holeIndices, dim, true);
+    }
+
+    if (needsRefine) refine(triangles, data, dim);
+
     return triangles;
 }
 
 // create a circular doubly linked list from polygon points in the specified winding order
-/** @param {ArrayLike<number>} data @param {number} start @param {number} end @param {number} dim @param {boolean} clockwise @returns {Node | null} */
-function linkedList(data, start, end, dim, clockwise) {
+/** @param {ArrayLike<number>} data @param {number} start @param {number} end @param {number} dim @param {boolean} clockwise @param {boolean} repair @returns {Node | null} */
+function linkedList(data, start, end, dim, clockwise, repair) {
     /** @type {Node | null} */
     let last = null;
+    const order = repair ? repairRing(data, start, end, dim) : null;
 
-    if (clockwise === (signedArea(data, start, end, dim) > 0)) {
+    if (order) {
+        const area = orderedArea(data, start, order, dim);
+        if (clockwise === (area > 0)) {
+            for (let i = 0; i < order.length; i++) {
+                const j = start + order[i] * dim;
+                last = insertNode(order[i], data[j], data[j + 1], last);
+            }
+        } else {
+            for (let i = order.length - 1; i >= 0; i--) {
+                const j = start + order[i] * dim;
+                last = insertNode(order[i], data[j], data[j + 1], last);
+            }
+        }
+    } else if (clockwise === (signedArea(data, start, end, dim) > 0)) {
         for (let i = start; i < end; i += dim) last = insertNode(i / dim | 0, data[i], data[i + 1], last);
     } else {
         for (let i = end - dim; i >= start; i -= dim) last = insertNode(i / dim | 0, data[i], data[i + 1], last);
@@ -98,6 +137,84 @@ function linkedList(data, start, end, dim, clockwise) {
     }
 
     return last;
+}
+
+// Repair rings with clear proper edge crossings before they reach the slicer. A 2-opt reversal
+// untangles the crossed loop without introducing vertices that aren't present in the caller's
+// coordinate array, which is essential because the output is only an index array. The quadratic
+// scan is capped: ordinary map rings take the untouched fast path, while bad large rings still
+// receive the slicer's local intersection healing and split fallback.
+const MAX_REPAIR_RING = 512;
+
+/** @param {ArrayLike<number>} data @param {number} start @param {number} end @param {number} dim @returns {number[] | null} */
+function repairRing(data, start, end, dim) {
+    const n = (end - start) / dim;
+    if (n < 4 || n > MAX_REPAIR_RING) return null;
+
+    let order = null;
+    for (let pass = 0; pass < n; pass++) {
+        const cross = findRingCrossing(data, start, n, dim, order);
+        if (!cross) return order;
+        if (!order) order = identityOrder(n);
+
+        // Reverse the loop between the two crossed edges. This is the standard 2-opt uncrossing
+        // step and keeps every original vertex exactly once.
+        const next = order.slice();
+        for (let left = cross[0] + 1, right = cross[1]; left < right; left++, right--) {
+            const tmp = next[left];
+            next[left] = next[right];
+            next[right] = tmp;
+        }
+        order = next;
+    }
+    return null;
+}
+
+/** @param {number} n @returns {number[]} */
+function identityOrder(n) {
+    const order = new Array(n);
+    for (let i = 0; i < n; i++) order[i] = i;
+    return order;
+}
+
+/** @param {ArrayLike<number>} data @param {number} start @param {number} n @param {number} dim @param {number[] | null} order @returns {[number, number] | null} */
+function findRingCrossing(data, start, n, dim, order) {
+    for (let i = 0; i < n; i++) {
+        const i0 = start + (order ? order[i] : i) * dim;
+        const i1 = start + (order ? order[(i + 1) % n] : (i + 1) % n) * dim;
+        const ax = data[i0], ay = data[i0 + 1], bx = data[i1], by = data[i1 + 1];
+
+        for (let j = i + 2; j < n; j++) {
+            if (i === 0 && j === n - 1) continue;
+            const j0 = start + (order ? order[j] : j) * dim;
+            const j1 = start + (order ? order[(j + 1) % n] : (j + 1) % n) * dim;
+            const cx = data[j0], cy = data[j0 + 1], dx = data[j1], dy = data[j1 + 1];
+            if (properIntersect(ax, ay, bx, by, cx, cy, dx, dy)) return [i, j];
+        }
+    }
+    return null;
+}
+
+/** @param {number} ax @param {number} ay @param {number} bx @param {number} by @param {number} cx @param {number} cy @param {number} dx @param {number} dy @returns {boolean} */
+function properIntersect(ax, ay, bx, by, cx, cy, dx, dy) {
+    const abx = bx - ax, aby = by - ay;
+    const cdx = dx - cx, cdy = dy - cy;
+    const o1 = abx * (cy - ay) - aby * (cx - ax);
+    const o2 = abx * (dy - ay) - aby * (dx - ax);
+    const o3 = cdx * (ay - cy) - cdy * (ax - cx);
+    const o4 = cdx * (by - cy) - cdy * (bx - cx);
+    return o1 * o2 < 0 && o3 * o4 < 0;
+}
+
+/** @param {ArrayLike<number>} data @param {number} start @param {number[]} order @param {number} dim @returns {number} */
+function orderedArea(data, start, order, dim) {
+    let sum = 0;
+    for (let i = 0, j = order.length - 1; i < order.length; j = i++) {
+        const a = start + order[j] * dim;
+        const b = start + order[i] * dim;
+        sum += (data[a] - data[b]) * (data[b + 1] + data[a + 1]);
+    }
+    return sum;
 }
 
 // Remove collinear or coincident points; removability depends only on a node's immediate
@@ -145,7 +262,7 @@ function earcutLinked(ear, triangles, minX, minY, invSize) {
         const next = ear.next;
 
         if (area(prev, ear, next) < 0 && (convex || (invSize ? isEarHashed(ear, minX, minY, invSize) : isEar(ear)))) {
-            triangles.push(prev.i, ear.i, next.i); // cut off the triangle
+            emitTriangle(triangles, prev, ear, next);
 
             removeNode(ear);
             ear = next;
@@ -188,6 +305,17 @@ function isConvex(start) {
         p = p.next;
     } while (p !== start);
     return true;
+}
+
+/** @param {number[]} triangles @param {Node} a @param {Node} b @param {Node} c */
+function emitTriangle(triangles, a, b, c) {
+    triangles.push(a.i, b.i, c.i);
+    const abx = a.x - b.x, aby = a.y - b.y;
+    const bcx = b.x - c.x, bcy = b.y - c.y;
+    const cax = c.x - a.x, cay = c.y - a.y;
+    const sum = abx * abx + aby * aby + bcx * bcx + bcy * bcy + cax * cax + cay * cay;
+    const q = sum ? -2 * Math.sqrt(3) * area(a, b, c) / sum : 1;
+    if (q < AUTO_REFINE_QUALITY) needsRefine = true;
 }
 
 // check whether a polygon node forms a valid ear with adjacent nodes
@@ -249,7 +377,7 @@ function cureLocalIntersections(start, triangles) {
 
         if (intersects(a, p, p.next, b, false) && locallyInside(a, b) && locallyInside(b, a)) {
 
-            triangles.push(a.i, p.i, b.i);
+            emitTriangle(triangles, a, p, b);
 
             // remove two nodes involved
             removeNode(p);
@@ -288,6 +416,8 @@ function splitEarcut(start) {
         }
         a = a.next;
     } while (a !== start);
+
+    repairNeeded = true;
 }
 
 // true only while eliminateHoles merges holes, so removeNode keeps the block index live (growBlock)
@@ -301,7 +431,10 @@ function eliminateHoles(data, holeIndices, outerNode, dim) {
     for (let i = 0, len = holeIndices.length; i < len; i++) {
         const start = holeIndices[i] * dim;
         const end = i < len - 1 ? holeIndices[i + 1] * dim : data.length;
-        const list = /** @type {Node} */ (linkedList(data, start, end, dim, false));
+        // Reversing a crossed hole loop can change its enclosed area more than the slicer's local
+        // cure does, so explicit 2-opt repair is limited to the outer ring; holes still use the
+        // normal local-intersection fallback below.
+        const list = /** @type {Node} */ (linkedList(data, start, end, dim, false, false));
         if (list === list.next) steiners.add(list);
         queue.push(getLeftmost(list));
     }
@@ -341,15 +474,18 @@ function eliminateHole(hole, outerNode) {
     if (!bridge) {
         return outerNode;
     }
+    // The ray construction is stable for normal data; invoke the stricter visibility search only
+    // when that result is actually ambiguous (for example coincident/touching endpoints).
+    const stableBridge = bridgeIntersectsRing(hole, bridge) ? findShorterBridge(hole, bridge) : bridge;
 
-    const bridgeReverse = splitPolygon(bridge, hole);
+    const bridgeReverse = splitPolygon(stableBridge, hole);
 
     // index the merged-in segment before filtering: in ring order the splice runs
     // bridge -> hole -> bridgeReverse -> bridge2 -> (bridge's old next), covering the
     // hole's edges and both new slit edges. filterPoints below only drops collinear /
     // coincident points, so these bboxes stay valid (conservative) supersets.
     const bridge2 = bridgeReverse.next;
-    indexSegment(bridge, bridge2.next);
+    indexSegment(stableBridge, bridge2.next);
 
     // heal collinear/coincident points around the two new slit edges, but leave bridge2 alone: dropping it as collinear
     // would leave bridge lying on the healed edge, where a later hole could bridge into it from outside its sector
@@ -357,10 +493,12 @@ function eliminateHole(hole, outerNode) {
 
     // likewise, if bridge lies strictly between its prev and hole, healing would drop it and leave bridge2 on the healed
     // edge; skip the heal then (a spike at bridge, e.g. a hole touching an outer edge, still needs it)
-    const a = bridge.prev;
-    if (area(a, bridge, hole) === 0 && (a.x - bridge.x) * (hole.x - bridge.x) + (a.y - bridge.y) * (hole.y - bridge.y) < 0) return bridge;
+    const a = stableBridge.prev;
+    if (area(a, stableBridge, hole) === 0 &&
+            (a.x - stableBridge.x) * (hole.x - stableBridge.x) +
+            (a.y - stableBridge.y) * (hole.y - stableBridge.y) < 0) return stableBridge;
 
-    return filterPoints(bridge, bridge.next);
+    return filterPoints(stableBridge, stableBridge.next);
 }
 
 // Block-bbox index for findHoleBridge (issue #183): one [minX,minY,maxX,maxY] bbox per K
@@ -530,6 +668,82 @@ function findHoleBridge(hole, outerNode) {
 /** @param {Node} m @param {Node} p @returns {boolean} */
 function sectorContainsSector(m, p) {
     return area(m.prev, m, p.prev) < 0 && area(p.next, m, m.next) < 0;
+}
+
+// The ray bridge is a robust correctness fallback, but it can be unnecessarily long and leave
+// long thin triangle fans around a hole. Check nearby ring vertices and use the shortest valid
+// visible bridge when it is shorter than the ray result.
+/** @param {Node} hole @param {Node} bridge @returns {Node} */
+function findShorterBridge(hole, bridge) {
+    const bx = bridge.x - hole.x;
+    const by = bridge.y - hole.y;
+    let best = bridge;
+    let bestDist = bx * bx + by * by;
+
+    // Cull by the current best bridge's bbox. Blocks are bbox-filtered, so this is a local scan
+    // in normal map polygons rather than another walk of the whole merged ring.
+    const minX = hole.x - Math.abs(bx);
+    const maxX = hole.x + Math.abs(bx);
+    const minY = hole.y - Math.abs(by);
+    const maxY = hole.y + Math.abs(by);
+
+    for (let b = 0, g = 0; b < numBlocks; b++, g += 4) {
+        if (blockBBox[g + 2] < minX || blockBBox[g] > maxX ||
+                blockBBox[g + 3] < minY || blockBBox[g + 1] > maxY) continue;
+
+        const stop = liveBlockStop(b);
+        let p = liveBlockHead(b);
+        do {
+            // Keep the search on the hole's leftward side. The leftmost hole vertex is the ray
+            // origin, so a candidate to its right can cross the hole itself even when both
+            // endpoint sectors are individually valid.
+            if (p.x <= hole.x && !equals(p, bridge) && !equals(p, hole)) {
+                const dx = p.x - hole.x;
+                const dy = p.y - hole.y;
+                const dist = dx * dx + dy * dy;
+                if (dist < bestDist && bridgeVisible(hole, p)) {
+                    best = p;
+                    bestDist = dist;
+                }
+            }
+            p = p.next;
+        } while (p !== stop);
+    }
+    return best;
+}
+
+// A bridge is safe when both endpoint sectors see each other, the segment doesn't properly
+// cross a ring edge, and the midpoint is inside the merged ring. This is deliberately stricter
+// than the ray construction, which can land on a numerically ambiguous endpoint.
+/** @param {Node} a @param {Node} b @returns {boolean} */
+function bridgeVisible(a, b) {
+    if (equals(a, b)) return true;
+    if (!locallyInside(a, b) || !locallyInside(b, a)) return false;
+    if (!middleInside(b, a)) return false;
+    return !bridgeIntersectsRing(a, b);
+}
+
+/** @param {Node} a @param {Node} b @returns {boolean} */
+function bridgeIntersectsRing(a, b) {
+    const minX = Math.min(a.x, b.x);
+    const maxX = Math.max(a.x, b.x);
+    const minY = Math.min(a.y, b.y);
+    const maxY = Math.max(a.y, b.y);
+
+    for (let i = 0, g = 0; i < numBlocks; i++, g += 4) {
+        if (blockBBox[g + 2] < minX || blockBBox[g] > maxX ||
+                blockBBox[g + 3] < minY || blockBBox[g + 1] > maxY) continue;
+
+        const stop = liveBlockStop(i);
+        let p = liveBlockHead(i);
+        do {
+            const q = p.next;
+            if (p !== a && p !== b && q !== a && q !== b &&
+                    intersects(p, q, a, b, false)) return true;
+            p = q;
+        } while (p !== stop);
+    }
+    return false;
 }
 
 // scratch buffers reused across calls and grown on demand: two node-ref arrays that
